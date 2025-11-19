@@ -1,0 +1,238 @@
+# fastapi_app.py (FINAL LOCAL ENGINE VERSION - Includes Fixes for Upload Limit)
+
+import os
+import uuid
+import shutil
+import json
+from fastapi import (
+    FastAPI, 
+    Form, 
+    UploadFile, 
+    File, 
+    BackgroundTasks, 
+    HTTPException
+)
+import starlette.formparsers # FIX 1: For file limit override
+from fastapi.middleware.cors import CORSMiddleware 
+from fastapi.responses import JSONResponse, FileResponse
+from pydantic import BaseModel
+from typing import List, Optional
+
+from storypilot_core import (
+    generate_prompts_from_story,
+    map_images_by_prompt_number,
+    generate_voice_fallback,
+    create_video_from_prompts,
+    UPLOADS_DIR,
+    OUTPUT_DIR
+)
+
+app = FastAPI(title="StoryPilot Engine")
+
+# --- FIX: Unlimited File Upload Limit (Starlette/Werkzeug) ---
+starlette.formparsers.MaxValuesEntry = 5000 
+# --- END OF FIX ---
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+jobs_db = {} 
+
+class AnalyzeResponse(BaseModel):
+    copyable_prompts: str
+    full_voice_text: str
+    scene_count: int
+    job_id: str
+    scene_texts: List[str]
+
+class JobStatus(BaseModel):
+    job_id: str
+    status: str
+    message: Optional[str] = None
+    video_url: Optional[str] = None
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze_story(story_text: str = Form(...)):
+    result = generate_prompts_from_story(story_text)
+    job_id = f"job_{uuid.uuid4().hex[:8]}"
+    
+    jobs_db[job_id] = {
+        "image_files": [], 
+        "voice_file": None, 
+        "status": "pending",
+        "scene_texts_for_caption": result.scene_texts
+    }
+    
+    return AnalyzeResponse(
+        copyable_prompts=result.copyable_prompts_text,
+        full_voice_text=result.full_story_for_voice,
+        scene_count=result.scene_count,
+        job_id=job_id,
+        scene_texts=result.scene_texts
+    )
+
+@app.post("/upload_images")
+async def upload_images(job_id: str = Form(...), files: List[UploadFile] = File(...)):
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Job ID not found. Please analyze story first.")
+    
+    image_paths = []
+    image_dir = os.path.join(UPLOADS_DIR, "images", job_id)
+    os.makedirs(image_dir, exist_ok=True)
+    
+    for file in files:
+        safe_filename = os.path.basename(file.filename)
+        file_path = os.path.join(image_dir, safe_filename)
+        # Use await file.read() for proper async file writing
+        with open(file_path, "wb") as buffer:
+            while True:
+                chunk = await file.read(1024 * 1024) 
+                if not chunk:
+                    break
+                buffer.write(chunk)
+        image_paths.append(file_path)
+        
+    jobs_db[job_id]["image_files"].extend(image_paths)
+    return {"message": f"{len(files)} images uploaded for job {job_id}", "files": image_paths}
+
+@app.post("/upload_voice")
+async def upload_voice(job_id: str = Form(...), file: UploadFile = File(...)):
+    if job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Job ID not found. Please analyze story first.")
+
+    voice_dir = os.path.join(UPLOADS_DIR, "audio", job_id)
+    os.makedirs(voice_dir, exist_ok=True)
+    
+    safe_filename = os.path.basename(file.filename)
+    file_path = os.path.join(voice_dir, safe_filename)
+    
+    with open(file_path, "wb") as buffer:
+        while True:
+            chunk = await file.read(1024 * 1024) 
+            if not chunk:
+                break
+            buffer.write(chunk)
+        
+    jobs_db[job_id]["voice_file"] = file_path
+    return {"message": f"Voice file uploaded for job {job_id}", "file": file_path}
+
+
+def background_video_task(
+    job_id: str, 
+    full_text: str, 
+    voice_gender: str, 
+    target_duration: Optional[float],
+    scene_texts_for_caption: List[str]
+):
+    try:
+        job_data = jobs_db[job_id]
+        job_data["status"] = "processing"
+        
+        image_files = job_data.get("image_files", [])
+        if not image_files:
+            raise Exception("No images found for this job.")
+            
+        prompt_map = map_images_by_prompt_number(image_files)
+        if not prompt_map:
+            raise Exception("Could not map any images to prompts based on filename.")
+
+        voice_file = job_data.get("voice_file")
+        if not voice_file:
+            print(f"Job {job_id}: No voice uploaded, generating gTTS fallback...")
+            voice_file = generate_voice_fallback(full_text, voice_gender, job_id)
+            if not voice_file or not os.path.exists(voice_file):
+                raise Exception("Voice file not provided and fallback generation failed.")
+            job_data["voice_file"] = voice_file
+        
+        final_video_path = create_video_from_prompts(
+            prompt_image_map=map_images_by_prompt_number(image_files),
+            voice_file_path=voice_file,
+            job_id=job_id,
+            target_duration_minutes=target_duration,
+            scene_texts_for_caption=scene_texts_for_caption
+        )
+        
+        if not final_video_path or not os.path.exists(final_video_path):
+            raise Exception("FFmpeg processing failed to create final video.")
+
+        video_url = f"/download_video/{job_id}"
+        job_data["status"] = "completed"
+        job_data["video_url"] = video_url
+        job_data["final_path"] = final_video_path
+        
+        print(f"Job {job_id} completed successfully. Video: {final_video_path}")
+
+    except Exception as e:
+        print(f"Error in background task for job {job_id}: {e}")
+        jobs_db[job_id]["status"] = "failed"
+        jobs_db[job_id]["message"] = str(e)
+
+
+@app.post("/generate_video", response_model=JobStatus)
+async def generate_video(
+    background_tasks: BackgroundTasks,
+    full_story_text: str = Form(...),
+    job_id: Optional[str] = Form(None),
+    target_duration_minutes: Optional[float] = Form(None),
+    voice_gender: str = Form("male"),
+):
+    if not job_id or job_id not in jobs_db:
+        raise HTTPException(status_code=404, detail="Invalid Job ID. Please analyze story first.")
+    
+    job_data = jobs_db[job_id]
+    scene_texts = job_data.get("scene_texts_for_caption", [])
+
+    background_tasks.add_task(
+        background_video_task, 
+        job_id, 
+        full_story_text, 
+        voice_gender, 
+        target_duration_minutes,
+        scene_texts
+    )
+    
+    return JobStatus(
+        job_id=job_id, 
+        status="processing", 
+        message="Video generation started in the background."
+    )
+
+@app.get("/job_status/{job_id}", response_model=JobStatus)
+async def get_job_status(job_id: str):
+    job = jobs_db.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    return JobStatus(
+        job_id=job_id,
+        status=job.get("status", "unknown"),
+        message=job.get("message"),
+        video_url=job.get("video_url")
+    )
+
+@app.get("/download_video/{job_id}")
+async def download_video(job_id: str):
+    job = jobs_db.get(job_id)
+    if not job or job.get("status") != "completed":
+        raise HTTPException(status_code=444, detail="Video not ready or job failed.")
+        
+    file_path = job.get("final_path")
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Video file not found on server.")
+
+    return FileResponse(
+        path=file_path,
+        media_type="video/mp4",
+        filename=os.path.basename(file_path)
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    print("Starting StoryPilot server at http://127.0.0.1:8000")
+    print("This is the 'Pro' version, running on 127.0.0.1 to avoid firewall issues.")
+    uvicorn.run(app, host="127.0.0.1", port=8000)
